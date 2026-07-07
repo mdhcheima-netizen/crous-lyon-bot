@@ -1,4 +1,4 @@
-yamlname: Vérification logements CROUS Lyon
+name: Vérification logements CROUS Lyon
 
 on:
   schedule:
