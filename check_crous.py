@@ -4,6 +4,10 @@ Vérifie UNIQUEMENT les logements INDIVIDUELS (pas de colocation) dans une
 liste précise de résidences CROUS à Lyon (phase complémentaire 2026-2027),
 et envoie une notification Telegram pour chaque NOUVELLE annonce détectée,
 en indiquant le rang de préférence de la résidence.
+
+Le site cible étant une application JavaScript (SPA), on utilise Playwright
+(un navigateur Chromium piloté automatiquement) pour charger les pages
+exactement comme le ferait une personne, plutôt qu'une simple requête HTTP.
 """
 
 import json
@@ -16,13 +20,12 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://trouverunlogement.lescrous.fr"
 SEARCH_URL = f"{BASE_URL}/tools/45/search"  # 45 = année universitaire 2026-2027
 DATA_FILE = Path(__file__).parent / "data" / "seen.json"
 
-# Résidences ciblées, dans l'ordre de préférence (1 = préférée)
-# "match" = mot-clé unique qui permet de reconnaître la résidence dans le texte de l'annonce
 RESIDENCES = [
     {"rank": 1, "label": "RESIDENCE BUGEAUD", "match": "BUGEAUD",
      "address": "119 Rue Bugeaud 69006 Lyon"},
@@ -42,58 +45,21 @@ RESIDENCES = [
      "address": "2 rue soeur Bouvier 69322 Lyon Cedex 05"},
 ]
 
-# Mots qui indiquent une colocation -> à exclure systématiquement
 COLOC_EXCLUDE = re.compile(r"colocation|coloc\b", re.IGNORECASE)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-# Une session pour garder les cookies entre les requêtes, comme un vrai navigateur
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
-_WARMED_UP = False
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def normalize(text: str) -> str:
-    """Enlève les accents et met en majuscule, pour matcher plus facilement."""
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     return text.upper()
 
 
-def get_soup(url: str) -> BeautifulSoup:
-    global _WARMED_UP
-    if not _WARMED_UP:
-        # On visite d'abord la page d'accueil pour récupérer les cookies de session,
-        # exactement comme le ferait un navigateur avant d'aller sur une page de résultats.
-        SESSION.get(BASE_URL + "/", timeout=20)
-        _WARMED_UP = True
-
-    resp = SESSION.get(url, timeout=20)
-    resp.raise_for_status()
-    return BeautifulSoup(resp.text, "html.parser")
-
-
-def get_total_pages(soup: BeautifulSoup) -> int:
-    max_page = 1
-    for a in soup.select('a[href*="page="]'):
-        m = re.search(r"page=(\d+)", a.get("href", ""))
-        if m:
-            max_page = max(max_page, int(m.group(1)))
-    return max_page
-
-
 def match_residence(card_text: str):
-    """Retourne le dict de la résidence ciblée si le texte de l'annonce correspond, sinon None."""
     norm = normalize(card_text)
     for res in RESIDENCES:
         if normalize(res["match"]) in norm:
@@ -113,11 +79,9 @@ def extract_listings(soup: BeautifulSoup) -> dict:
         card = link.find_parent("li") or link.find_parent("article") or link.parent
         card_text = card.get_text(" ", strip=True) if card else link.get_text(" ", strip=True)
 
-        # 1. On exclut toute colocation, quelle que soit la résidence
         if COLOC_EXCLUDE.search(card_text):
             continue
 
-        # 2. On ne garde que les résidences ciblées
         residence = match_residence(card_text)
         if residence is None:
             continue
@@ -139,22 +103,56 @@ def extract_listings(soup: BeautifulSoup) -> dict:
     return results
 
 
+def get_total_pages(soup: BeautifulSoup) -> int:
+    max_page = 1
+    for a in soup.select('a[href*="page="]'):
+        m = re.search(r"page=(\d+)", a.get("href", ""))
+        if m:
+            max_page = max(max_page, int(m.group(1)))
+    title_text = soup.title.get_text() if soup.title else ""
+    m2 = re.search(r"sur\s+(\d+)", title_text)
+    if m2:
+        max_page = max(max_page, int(m2.group(1)))
+    return max_page
+
+
 def fetch_all_target_listings() -> dict:
     all_results = {}
-    soup = get_soup(SEARCH_URL)
-    total_pages = get_total_pages(soup)
-    all_results.update(extract_listings(soup))
 
-    print(f"Total pages à parcourir : {total_pages}")
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        context = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="fr-FR",
+        )
+        page = context.new_page()
 
-    for page in range(2, total_pages + 1):
-        time.sleep(0.5)
-        try:
-            page_soup = get_soup(f"{SEARCH_URL}?page={page}")
-        except requests.RequestException as e:
-            print(f"Erreur page {page}: {e}", file=sys.stderr)
-            continue
-        all_results.update(extract_listings(page_soup))
+        print(f"Chargement de {SEARCH_URL} ...")
+        page.goto(SEARCH_URL, wait_until="networkidle", timeout=45000)
+        page.wait_for_timeout(1500)
+
+        html = page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        total_pages = get_total_pages(soup)
+        print(f"Total pages à parcourir : {total_pages}")
+        all_results.update(extract_listings(soup))
+
+        for page_num in range(2, total_pages + 1):
+            try:
+                page.goto(
+                    f"{SEARCH_URL}?page={page_num}",
+                    wait_until="networkidle",
+                    timeout=45000,
+                )
+                page.wait_for_timeout(800)
+                html = page.content()
+                soup = BeautifulSoup(html, "html.parser")
+                all_results.update(extract_listings(soup))
+            except Exception as e:
+                print(f"Erreur page {page_num}: {e}", file=sys.stderr)
+                continue
+
+        browser.close()
 
     return all_results
 
@@ -196,7 +194,6 @@ def main():
 
     print(f"{len(current)} logements ciblés trouvés, dont {len(new_ids)} nouveaux.")
 
-    # On trie les nouveaux par ordre de préférence (rang 1 = message envoyé en premier)
     new_ids.sort(key=lambda lid: current[lid]["residence_rank"])
 
     if new_ids:
