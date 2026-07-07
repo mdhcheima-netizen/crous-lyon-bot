@@ -20,8 +20,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Installer les dépendances
-        run: pip install requests beautifulsoup4
+      - name: Installer les dépendances Python
+        run: pip install requests beautifulsoup4 playwright
+
+      - name: Installer le navigateur Chromium
+        run: python -m playwright install --with-deps chromium
 
       - name: Lancer la vérification
         env:
