@@ -46,8 +46,21 @@ RESIDENCES = [
 COLOC_EXCLUDE = re.compile(r"colocation|coloc\b", re.IGNORECASE)
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CrousLyonWatcher/1.0; personal use)"
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
+
+# Une session pour garder les cookies entre les requêtes, comme un vrai navigateur
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
+_WARMED_UP = False
 
 
 def normalize(text: str) -> str:
@@ -58,7 +71,14 @@ def normalize(text: str) -> str:
 
 
 def get_soup(url: str) -> BeautifulSoup:
-    resp = requests.get(url, headers=HEADERS, timeout=20)
+    global _WARMED_UP
+    if not _WARMED_UP:
+        # On visite d'abord la page d'accueil pour récupérer les cookies de session,
+        # exactement comme le ferait un navigateur avant d'aller sur une page de résultats.
+        SESSION.get(BASE_URL + "/", timeout=20)
+        _WARMED_UP = True
+
+    resp = SESSION.get(url, timeout=20)
     resp.raise_for_status()
     return BeautifulSoup(resp.text, "html.parser")
 
